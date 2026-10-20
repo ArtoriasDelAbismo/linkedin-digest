@@ -23,6 +23,9 @@ Write the post in plain text, since LinkedIn does not render markdown:
 - A closing line inviting readers to share which story stood out to them.
 - 3-5 relevant hashtags on the last line.
 
+Write the whole post in {language}, translating headlines and summaries from the source
+articles (hashtags may stay in English when that is how they are commonly used).
+
 Keep it under 2,500 characters. Be accurate: only state what the article title and summary
 support, and never invent numbers or quotes. Output only the post text."""
 
@@ -37,7 +40,7 @@ def _format(articles: list[Article]) -> str:
 
 def write_digest(articles: list[Article]) -> str:
     voice = os.getenv("AUTHOR_VOICE", "").strip()
-    system = SYSTEM + (f"\n\nAbout the author, to match their voice and perspective: {voice}" if voice else "")
+    system = SYSTEM.format(language=os.getenv("POST_LANGUAGE", "English")) + (f"\n\nAbout the author, to match their voice and perspective: {voice}" if voice else "")
     # Only needed for API keys that aren't scoped to a workspace
     workspace = os.getenv("ANTHROPIC_WORKSPACE_ID", "").strip()
     client = anthropic.Anthropic(default_headers={"anthropic-workspace-id": workspace} if workspace else None)
