@@ -1,0 +1,8 @@
+anthropic==1.15.0
+APScheduler==3.11.3
+fastapi==0.156.0
+feedparser==6.0.14
+httpx==0.28.1
+python-dotenv==1.2.4
+python-multipart==0.0.32
+uvicorn[standard]==0.54.0
