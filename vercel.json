@@ -6,6 +6,6 @@
     }
   },
   "crons": [
-    { "path": "/cron", "schedule": "0 19 * * 1" }
+    { "path": "/cron", "schedule": "0 19 * * 5" }
   ]
 }
