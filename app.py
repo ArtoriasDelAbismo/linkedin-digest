@@ -1,5 +1,7 @@
 """Web service: LinkedIn login, draft approval page, and the weekly digest schedule."""
 
+import hashlib
+import hmac
 import os
 import secrets
 import time
@@ -9,7 +11,7 @@ from html import escape
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 from dotenv import load_dotenv
-from fastapi import FastAPI, Form, HTTPException
+from fastapi import FastAPI, Form, Header, HTTPException
 from fastapi.responses import HTMLResponse, RedirectResponse
 
 load_dotenv()
@@ -21,7 +23,9 @@ from notify import notify  # noqa: E402
 from writer import write_digest  # noqa: E402
 
 REAUTH_WARNING_DAYS = 10
-_oauth_states: set[str] = set()
+OAUTH_STATE_TTL = 600
+# On Vercel nothing runs between requests, so Vercel Cron calls /cron instead of the in-process scheduler
+ON_VERCEL = bool(os.getenv("VERCEL"))
 
 
 def public_url(path: str) -> str:
@@ -32,6 +36,22 @@ def check_key(key: str) -> None:
     expected = os.environ.get("ADMIN_KEY", "")
     if not expected or not secrets.compare_digest(key, expected):
         raise HTTPException(403, "Wrong key")
+
+
+def _sign(value: str) -> str:
+    return hmac.new(os.environ["ADMIN_KEY"].encode(), value.encode(), hashlib.sha256).hexdigest()[:32]
+
+
+def make_oauth_state() -> str:
+    """A signed, timestamped state value, so the login check survives across serverless instances."""
+    issued = str(int(time.time()))
+    return f"{issued}.{_sign(issued)}"
+
+
+def valid_oauth_state(state: str) -> bool:
+    issued, _, sig = state.partition(".")
+    return (issued.isdigit() and secrets.compare_digest(sig, _sign(issued))
+            and time.time() - int(issued) < OAUTH_STATE_TTL)
 
 
 def weekly_job() -> str | None:
@@ -58,6 +78,9 @@ def weekly_job() -> str | None:
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
+    if ON_VERCEL:
+        yield
+        return
     scheduler = BackgroundScheduler()
     scheduler.add_job(weekly_job, CronTrigger(
         day_of_week=os.getenv("DIGEST_DAY", "mon"),
@@ -111,21 +134,27 @@ def run_now(key: str = ""):
     return RedirectResponse(f"/draft/{draft_id}", status_code=303)
 
 
+@app.get("/cron")
+def cron(authorization: str = Header("")):
+    """Called weekly by Vercel Cron, which sends the CRON_SECRET as a bearer token."""
+    expected = os.environ.get("CRON_SECRET", "")
+    if not expected or not secrets.compare_digest(authorization, f"Bearer {expected}"):
+        raise HTTPException(401)
+    return {"draft_id": weekly_job()}
+
+
 @app.get("/login")
 def login(key: str = ""):
     check_key(key)
-    state = secrets.token_urlsafe(16)
-    _oauth_states.add(state)
-    return RedirectResponse(linkedin.authorize_url(state))
+    return RedirectResponse(linkedin.authorize_url(make_oauth_state()))
 
 
 @app.get("/callback")
 def callback(state: str = "", code: str = "", error: str = "", error_description: str = ""):
     if error:
         return page(f"<p>LinkedIn login failed: {escape(error_description or error)}</p>")
-    if state not in _oauth_states:
-        raise HTTPException(400, "Unknown login attempt, start again from the status page")
-    _oauth_states.discard(state)
+    if not valid_oauth_state(state):
+        raise HTTPException(400, "Login link expired or invalid, start again from the status page")
     auth = linkedin.exchange_code(code)
     db.save_auth(**auth)
     return page(f"<p>Connected as <b>{escape(auth['name'])}</b>. You can close this page.</p>")
