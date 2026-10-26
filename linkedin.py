@@ -1,16 +1,19 @@
 """LinkedIn OAuth (3-legged) and the Posts API."""
 
+import io
 import os
 import re
 import time
 from urllib.parse import urlencode
 
 import httpx
+from PIL import Image
 
 AUTH_URL = "https://www.linkedin.com/oauth/v2/authorization"
 TOKEN_URL = "https://www.linkedin.com/oauth/v2/accessToken"
 USERINFO_URL = "https://api.linkedin.com/v2/userinfo"
 POSTS_URL = "https://api.linkedin.com/rest/posts"
+IMAGES_URL = "https://api.linkedin.com/rest/images?action=initializeUpload"
 SCOPES = "openid profile w_member_social"
 API_VERSION = os.getenv("LINKEDIN_API_VERSION", "202610")
 
@@ -18,6 +21,8 @@ API_VERSION = os.getenv("LINKEDIN_API_VERSION", "202610")
 # Left unescaped they can make the API silently truncate the post.
 _RESERVED = re.compile(r"([\\|{}@\[\]()<>*_~]|#(?!\w))")
 _URL = re.compile(r"https?://\S+")
+# Image types LinkedIn accepts as-is; anything else (e.g. WebP, AVIF) is converted to JPEG
+_LINKEDIN_IMAGE_TYPES = {"image/jpeg", "image/png", "image/gif"}
 
 
 def escape_commentary(text: str) -> str:
@@ -67,9 +72,44 @@ def exchange_code(code: str) -> dict:
     }
 
 
-def create_post(access_token: str, person_urn: str, text: str) -> str:
-    """Publish a public text post. Returns the post URN."""
-    r = httpx.post(POSTS_URL, json={
+def _headers(access_token: str) -> dict:
+    return {
+        "Authorization": f"Bearer {access_token}",
+        "LinkedIn-Version": API_VERSION,
+        "X-Restli-Protocol-Version": "2.0.0",
+    }
+
+
+def _download_image(url: str) -> bytes:
+    r = httpx.get(url, headers={"User-Agent": "Mozilla/5.0 WeeklyTechDigest/1.0"}, follow_redirects=True, timeout=30)
+    r.raise_for_status()
+    if r.headers.get("content-type", "").split(";")[0].strip() in _LINKEDIN_IMAGE_TYPES:
+        return r.content
+    img = Image.open(io.BytesIO(r.content)).convert("RGB")
+    out = io.BytesIO()
+    img.save(out, "JPEG", quality=90)
+    return out.getvalue()
+
+
+def upload_image(access_token: str, person_urn: str, image_url: str) -> str:
+    """Upload the image at image_url to LinkedIn. Returns its image URN."""
+    data = _download_image(image_url)
+    r = httpx.post(IMAGES_URL, json={"initializeUploadRequest": {"owner": person_urn}},
+                   headers=_headers(access_token), timeout=30)
+    if r.status_code != 200:
+        raise RuntimeError(f"LinkedIn image upload returned {r.status_code}: {r.text}")
+    upload = r.json()["value"]
+    put = httpx.put(upload["uploadUrl"], content=data,
+                    headers={"Authorization": f"Bearer {access_token}"}, timeout=60)
+    if put.status_code >= 300:
+        raise RuntimeError(f"LinkedIn image upload returned {put.status_code}: {put.text}")
+    return upload["image"]
+
+
+def create_post(access_token: str, person_urn: str, text: str,
+                image_urn: str | None = None, alt_text: str = "") -> str:
+    """Publish a public post, with an image when image_urn is given. Returns the post URN."""
+    body = {
         "author": person_urn,
         "commentary": escape_commentary(text),
         "visibility": "PUBLIC",
@@ -80,11 +120,10 @@ def create_post(access_token: str, person_urn: str, text: str) -> str:
         },
         "lifecycleState": "PUBLISHED",
         "isReshareDisabledByAuthor": False,
-    }, headers={
-        "Authorization": f"Bearer {access_token}",
-        "LinkedIn-Version": API_VERSION,
-        "X-Restli-Protocol-Version": "2.0.0",
-    }, timeout=30)
+    }
+    if image_urn:
+        body["content"] = {"media": {"id": image_urn, "altText": alt_text[:4086]}}
+    r = httpx.post(POSTS_URL, json=body, headers=_headers(access_token), timeout=30)
     if r.status_code != 201:
         raise RuntimeError(f"LinkedIn returned {r.status_code}: {r.text}")
     return r.headers.get("x-restli-id", "")

@@ -6,6 +6,7 @@
     }
   },
   "crons": [
-    { "path": "/cron", "schedule": "0 19 * * 5" }
+    { "path": "/cron", "schedule": "0 19 * * 5" },
+    { "path": "/cron/spotlight", "schedule": "0 19 * * 2" }
   ]
 }

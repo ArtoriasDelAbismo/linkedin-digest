@@ -5,8 +5,10 @@ import html
 import re
 import time
 from dataclasses import dataclass
+from urllib.parse import urljoin
 
 import feedparser
+import httpx
 
 # (topic, source name, feed URL)
 FEEDS = [
@@ -39,11 +41,46 @@ class Article:
     link: str
     summary: str
     published: float
+    image: str = ""  # image URL from the feed entry, if it had one
 
 
 def _clean(raw: str) -> str:
     text = html.unescape(re.sub(r"<[^>]+>", " ", raw or ""))
     return re.sub(r"\s+", " ", text).strip()[:SUMMARY_CHARS]
+
+
+def _entry_image(entry) -> str:
+    for media in entry.get("media_content", []) + entry.get("media_thumbnail", []):
+        if media.get("url") and media.get("medium", "image") == "image":
+            return media["url"]
+    for enc in entry.get("enclosures", []):
+        if enc.get("type", "").startswith("image/") and enc.get("href"):
+            return enc["href"]
+    return ""
+
+
+_META = re.compile(r"<meta\b[^>]*>", re.I)
+_ATTR = re.compile(r'([\w:-]+)\s*=\s*("[^"]*"|\'[^\']*\')')
+_IMAGE_PROPS = ("og:image:secure_url", "og:image:url", "og:image", "twitter:image", "twitter:image:src")
+
+
+def find_image(article: Article) -> str:
+    """The article's cover image: its og:image / twitter:image, else the image from the feed entry."""
+    try:
+        r = httpx.get(article.link, headers={"User-Agent": "Mozilla/5.0 WeeklyTechDigest/1.0"},
+                      follow_redirects=True, timeout=20)
+        found = {}
+        for tag in _META.findall(r.text[:500_000]):
+            attrs = {k.lower(): html.unescape(v[1:-1]).strip() for k, v in _ATTR.findall(tag)}
+            prop = (attrs.get("property") or attrs.get("name") or "").lower()
+            if prop in _IMAGE_PROPS and attrs.get("content"):
+                found.setdefault(prop, attrs["content"])
+        for prop in _IMAGE_PROPS:
+            if prop in found:
+                return urljoin(str(r.url), found[prop])
+    except httpx.HTTPError as e:
+        print(f"[feeds] could not open {article.link}: {e}")
+    return article.image
 
 
 def fetch_articles(days: int = 7) -> list[Article]:
@@ -65,7 +102,7 @@ def fetch_articles(days: int = 7) -> list[Article]:
                 continue
             seen.add(link)
             articles.append(Article(topic, source, _clean(entry.get("title", "")), link,
-                                    _clean(entry.get("summary", "")), published))
+                                    _clean(entry.get("summary", "")), published, _entry_image(entry)))
             count += 1
             if count >= MAX_PER_FEED:
                 break

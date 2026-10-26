@@ -20,7 +20,10 @@ SCHEMA = """
         text TEXT NOT NULL,
         status TEXT NOT NULL DEFAULT 'pending',  -- pending | posted | skipped
         post_urn TEXT,
-        created_at DOUBLE PRECISION NOT NULL
+        created_at DOUBLE PRECISION NOT NULL,
+        kind TEXT NOT NULL DEFAULT 'digest',  -- digest | spotlight
+        image_url TEXT,
+        image_alt TEXT
     );
     CREATE TABLE IF NOT EXISTS auth (
         id INTEGER PRIMARY KEY CHECK (id = 1),
@@ -30,6 +33,8 @@ SCHEMA = """
         name TEXT
     );
 """
+# Columns added after the first release, for databases created before them
+NEW_COLUMNS = {"drafts": [("kind", "TEXT NOT NULL DEFAULT 'digest'"), ("image_url", "TEXT"), ("image_alt", "TEXT")]}
 _schema_ready = False
 
 
@@ -52,11 +57,25 @@ def _cursor():
         if not _schema_ready:
             for stmt in filter(str.strip, SCHEMA.split(";")):
                 cur.execute(stmt)
+            _add_new_columns(cur)
             _schema_ready = True
         yield cur
         conn.commit()
     finally:
         conn.close()
+
+
+def _add_new_columns(cur) -> None:
+    for table, columns in NEW_COLUMNS.items():
+        if PG_URL:
+            for name, decl in columns:
+                cur.execute(f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {name} {decl}")
+            continue
+        cur.execute(f"PRAGMA table_info({table})")
+        existing = {row["name"] for row in cur.fetchall()}
+        for name, decl in columns:
+            if name not in existing:
+                cur.execute(f"ALTER TABLE {table} ADD COLUMN {name} {decl}")
 
 
 class _PgCursor:
@@ -69,11 +88,15 @@ class _PgCursor:
     def fetchone(self):
         return self._cur.fetchone()
 
+    def fetchall(self):
+        return self._cur.fetchall()
 
-def new_draft(text: str) -> str:
+
+def new_draft(text: str, kind: str = "digest", image_url: str | None = None, image_alt: str | None = None) -> str:
     draft_id = secrets.token_urlsafe(16)  # doubles as the secret in the approval link
     with _cursor() as c:
-        c.execute("INSERT INTO drafts (id, text, created_at) VALUES (?, ?, ?)", (draft_id, text, time.time()))
+        c.execute("INSERT INTO drafts (id, text, created_at, kind, image_url, image_alt) VALUES (?, ?, ?, ?, ?, ?)",
+                  (draft_id, text, time.time(), kind, image_url, image_alt))
     return draft_id
 
 
@@ -81,6 +104,14 @@ def get_draft(draft_id: str):
     with _cursor() as c:
         c.execute("SELECT * FROM drafts WHERE id = ?", (draft_id,))
         return c.fetchone()
+
+
+def recent_drafts(days: int) -> list:
+    """Drafts from the last `days` days that were posted or are still waiting for review."""
+    with _cursor() as c:
+        c.execute("SELECT * FROM drafts WHERE created_at > ? AND status != 'skipped' ORDER BY created_at DESC",
+                  (time.time() - days * 86400,))
+        return c.fetchall()
 
 
 def update_draft(draft_id: str, **fields) -> None:
