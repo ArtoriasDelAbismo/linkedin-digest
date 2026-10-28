@@ -1,7 +1,9 @@
-"""Web service: LinkedIn login, draft approval page, and the weekly schedule (digest and story of the week)."""
+"""Web service: LinkedIn login, draft approval page, and the weekly schedule (digest and story posts)."""
 
+import dataclasses
 import hashlib
 import hmac
+import json
 import os
 import re
 import secrets
@@ -19,13 +21,15 @@ load_dotenv()
 
 import db  # noqa: E402  (DATA_DIR must be loaded from .env first)
 import linkedin  # noqa: E402
-from feeds import fetch_articles, find_image  # noqa: E402
+from feeds import Article, fetch_articles, find_image  # noqa: E402
 from notify import notify  # noqa: E402
-from writer import write_digest, write_spotlight  # noqa: E402
+from writer import rank_stories, write_digest, write_spotlight  # noqa: E402
 
 REAUTH_WARNING_DAYS = 10
-# How far back to look for posts whose stories the story of the week must not repeat
+# How far back to look for posts whose stories a story post must not repeat
 RECENT_POSTS_DAYS = 14
+# How many stories the story post email offers to choose from
+STORY_OPTIONS = 4
 _URL = re.compile(r"https?://\S+")
 OAUTH_STATE_TTL = 600
 # On Vercel nothing runs between requests, so Vercel Cron calls /cron instead of the in-process scheduler
@@ -92,22 +96,29 @@ def spotlight_candidates() -> tuple[list, list[str]]:
 
 
 def spotlight_job() -> str | None:
-    """Draft a post about the story of the week, with its cover image, and email the approval link."""
+    """Pick the most relevant stories right now and email a link to choose which one to post about."""
     check_login()
     articles, recent = spotlight_candidates()
     if not articles:
-        notify("Story of the week: no articles found", "No new articles were found this week. Check the feeds.")
+        notify("Story post: no articles found", "No new articles were found this week. Check the feeds.")
         return None
-    article, text = write_spotlight(articles, recent)
-    image_url = find_image(article)
-    draft_id = db.new_draft(text, kind="spotlight", image_url=image_url or None, image_alt=article.title)
-    image_note = (f"Image: {image_url}" if image_url
-                  else "No cover image was found for this article. Add an image URL on the review page.")
-    notify("Your story of the week is ready to review",
-           f"Review, edit and post it here:\n{public_url('/draft/' + draft_id)}\n\n"
-           f"Nothing is posted until you click Post.\n\nStory: {article.title} ({article.source})\n"
-           f"{image_note}\n\n---\n\n{text}")
+    picks = rank_stories(articles, recent, STORY_OPTIONS)
+    options = [{"article": dataclasses.asdict(a), "why": why} for a, why in picks]
+    draft_id = db.new_draft("", kind="spotlight", status="choosing", options=json.dumps(options))
+    listing = "\n\n".join(f"{i}. [{a.topic}] {a.title} ({a.source})\n   {why}\n   {a.link}"
+                           for i, (a, why) in enumerate(picks, 1))
+    notify("Choose the story for your next LinkedIn post",
+           f"These are the most relevant stories right now. Pick one here and the post is written for you to review:\n"
+           f"{public_url('/draft/' + draft_id)}\n\nNothing is posted until you click Post.\n\n---\n\n{listing}")
     return draft_id
+
+
+def write_chosen_story(draft_id: str, option: dict) -> None:
+    """Write the post for the story chosen on a draft, find its image, and make it ready for review."""
+    article = Article(**option["article"])
+    text = write_spotlight(article)
+    db.update_draft(draft_id, text=text, status="pending", image_url=find_image(article) or None,
+                    image_alt=article.title)
 
 
 JOBS = {"digest": weekly_job, "spotlight": spotlight_job}
@@ -129,7 +140,7 @@ async def lifespan(_app: FastAPI):
         return
     scheduler = BackgroundScheduler()
     scheduler.add_job(weekly_job, CronTrigger(**schedule("DIGEST", "mon")))
-    scheduler.add_job(spotlight_job, CronTrigger(**schedule("SPOTLIGHT", "tue")))
+    scheduler.add_job(spotlight_job, CronTrigger(**schedule("SPOTLIGHT", "mon,wed")))
     scheduler.start()
     yield
     scheduler.shutdown()
@@ -145,6 +156,7 @@ textarea{{width:100%;box-sizing:border-box;min-height:60vh;font:15px/1.5 system-
 button{{font-size:16px;padding:10px 18px;border-radius:8px;border:0;cursor:pointer;margin:8px 8px 0 0}}
 input[type=url]{{width:100%;box-sizing:border-box;font:15px system-ui,sans-serif;padding:8px;border:1px solid #ccc;border-radius:8px}}
 .cover{{max-width:100%;border-radius:8px;display:block;margin:8px 0}}
+.story{{border-top:1px solid #ccc;padding:8px 0 16px}} .story p{{margin:4px 0}} button:disabled{{opacity:.5}}
 .post{{background:#0a66c2;color:#fff}} .skip{{background:#ddd}} .muted{{color:#666;font-size:14px}}
 @media (prefers-color-scheme:dark){{body{{background:#1b1b1a;color:#eee}}textarea,input[type=url]{{background:#262624;color:#eee;border-color:#444}}.skip{{background:#444;color:#eee}}.muted{{color:#aaa}}}}
 </style></head><body>{body}</body></html>"""
@@ -167,9 +179,9 @@ def status(key: str = ""):
 <p><a href="/login?key={escape(key)}">Connect / reconnect LinkedIn</a></p>
 <form method="post" action="/run?key={escape(key)}">
 <button class="post" name="kind" value="digest">Generate a digest now</button>
-<button class="post" name="kind" value="spotlight">Generate a story of the week now</button></form>
-<p class="muted">The digest is drafted every {_when("DIGEST", "mon")} and the story of the week
-every {_when("SPOTLIGHT", "tue")}.</p>""")
+<button class="post" name="kind" value="spotlight">Choose a story post now</button></form>
+<p class="muted">The digest is drafted every {_when("DIGEST", "mon")}, and story posts to choose from
+arrive every {_when("SPOTLIGHT", "mon,wed")}.</p>""")
 
 
 def _when(prefix: str, default_day: str) -> str:
@@ -222,6 +234,8 @@ def show_draft(draft_id: str):
     draft = db.get_draft(draft_id)
     if not draft:
         raise HTTPException(404)
+    if draft["status"] == "choosing":
+        return choose_page(draft_id, json.loads(draft["options"]))
     if draft["status"] != "pending":
         link = ""
         if draft["post_urn"]:
@@ -233,7 +247,7 @@ def show_draft(draft_id: str):
         preview = f'<img class="cover" src="{url}" alt="{escape(draft["image_alt"] or "")}">' if url else ""
         image = f"""<p><label>Image URL (leave empty to post without an image)<br>
 <input type="url" name="image_url" value="{url}"></label></p>{preview}"""
-    title = "This week's story" if draft["kind"] == "spotlight" else "This week's digest"
+    title = "Your story post" if draft["kind"] == "spotlight" else "This week's digest"
     return page(f"""<h1>{title}</h1>
 <p class="muted">Edit anything you like, then post it. Nothing goes to LinkedIn until you click Post.</p>
 <form method="post">{image}
@@ -242,6 +256,36 @@ def show_draft(draft_id: str):
 <button class="post" name="action" value="post" onclick="return confirm('Post this to LinkedIn?')">Post to LinkedIn</button>
 <button class="skip" name="action" value="skip">Skip this week</button>
 </form>""")
+
+
+def choose_page(draft_id: str, options: list[dict]) -> HTMLResponse:
+    stories = "".join(f"""<div class="story"><p class="muted">{escape(o["article"]["topic"])} · {escape(o["article"]["source"])}</p>
+<p><b><a href="{escape(o["article"]["link"])}">{escape(o["article"]["title"])}</a></b><br>{escape(o["why"])}</p>
+<button class="post" name="pick" value="{i}">Write about this one</button></div>""" for i, o in enumerate(options))
+    return page(f"""<h1>Choose your next story</h1>
+<p class="muted">Pick one and Claude writes the post with the article's image, for you to review.
+Nothing goes to LinkedIn until you click Post. Writing takes about a minute.</p>
+<form method="post" action="/draft/{escape(draft_id)}/choose"
+ onsubmit="setTimeout(() => {{ for (const b of this.querySelectorAll('button')) b.disabled = true; w.hidden = false }})">
+<p id="w" class="muted" hidden>Writing the post…</p>{stories}
+<p><button class="skip" name="pick" value="skip">Skip this one</button></p></form>""")
+
+
+@app.post("/draft/{draft_id}/choose")
+def choose_story(draft_id: str, pick: str = Form(...)):
+    draft = db.get_draft(draft_id)
+    if not draft:
+        raise HTTPException(404)
+    if draft["status"] != "choosing":  # already chosen or skipped, e.g. a second click
+        return RedirectResponse(f"/draft/{draft_id}", status_code=303)
+    if pick == "skip":
+        db.update_draft(draft_id, status="skipped")
+        return page("<p>Skipped. The next stories arrive with the next email.</p>")
+    options = json.loads(draft["options"])
+    if not pick.isdigit() or int(pick) >= len(options):
+        raise HTTPException(400, "Unknown story")
+    write_chosen_story(draft_id, options[int(pick)])
+    return RedirectResponse(f"/draft/{draft_id}", status_code=303)
 
 
 @app.post("/draft/{draft_id}")

@@ -1,14 +1,17 @@
 # Weekly Tech Digest
 
 Every week this service collects tech and science news from RSS feeds (software engineering, AI/ML,
-science, tech industry, SpaceX/NASA), has Claude write LinkedIn posts, and emails each one to you with a link
+science, tech industry, SpaceX/NASA, cybersecurity), has Claude write LinkedIn posts, and emails each one to you with a link
 to review it. Nothing is posted until you click **Post to LinkedIn** on that page.
 
-There are two weekly posts:
+There are two kinds of posts:
 
-- **Digest** (`DIGEST_DAY`): the 3-5 most significant stories of the week.
-- **Story of the week** (`SPOTLIGHT_DAY`): one post that goes deeper on the single most important story,
-  published with the article's cover image. You can change or remove the image on the review page.
+- **Digest** (`DIGEST_DAY`, Fridays): the 3-5 most significant stories of the week.
+- **Story posts** (`SPOTLIGHT_DAY`, Mondays and Wednesdays): an email offers the 4 most relevant stories
+  right now, from different topics. Pick one and Claude writes a post that goes deeper on it, published with
+  the article's cover image. You can change or remove the image on the review page.
+
+Stories linked in a post from the last 14 days are never offered again.
 
 ## Files
 
@@ -22,7 +25,7 @@ There are two weekly posts:
 
 ```bash
 cp .env.example .env        # fill in the secrets
-.venv/bin/python preview.py # see what a draft looks like (add "spotlight" for the story of the week)
+.venv/bin/python preview.py # see what a draft looks like (add "spotlight" for a story post)
 .venv/bin/uvicorn app:app --port 8000
 ```
 

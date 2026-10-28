@@ -1,4 +1,4 @@
-"""Turns a week of articles into LinkedIn posts with Claude: the weekly digest and the story of the week."""
+"""Turns a week of articles into LinkedIn posts with Claude: the weekly digest and single-story posts."""
 
 import os
 import re
@@ -13,8 +13,8 @@ MODEL = os.getenv("CLAUDE_MODEL", "claude-opus-5-5")
 SYSTEM = """You write a weekly LinkedIn digest of tech and science news for a professional audience.
 
 From the candidate articles, pick the 3-5 most significant and interesting stories of the week,
-spread across topics (software engineering, AI/ML, science, tech industry, SpaceX/NASA) when the
-week allows. Prefer substantive developments over rumors, deals or product minutiae.
+spread across topics (software engineering, AI/ML, science, tech industry, SpaceX/NASA,
+cybersecurity) when the week allows. Prefer substantive developments over rumors, deals or product minutiae.
 
 Write the post in plain text, since LinkedIn does not render markdown:
 - An opening hook line, then a blank line.
@@ -30,12 +30,20 @@ articles (hashtags may stay in English when that is how they are commonly used).
 Keep it under 2,500 characters. Be accurate: only state what the article title and summary
 support, and never invent numbers or quotes. Output only the post text."""
 
-SPOTLIGHT_SYSTEM = """You write a weekly LinkedIn post that goes deep on the single most important tech or
-science story of the week, for a professional audience. The post is published with the article's
-cover image.
+RANK_SYSTEM = """You pick stories for LinkedIn posts that each go deep on one tech, science or
+cybersecurity story, for a professional audience. The author chooses which one to post.
 
-From the candidate articles, pick the one story with the most significance and lasting impact.
-Prefer substantive developments over rumors, deals or product minutiae.
+From the candidate articles, pick the {count} most relevant stories right now: significant,
+with lasting impact, and worth discussing. Prefer substantive developments over rumors, deals or
+product minutiae. Pick each one from a different topic when the candidates allow, so the author
+has a real choice of subject.
+
+Output exactly {count} lines, most relevant first, each in this form:
+STORY: <article number> | <one sentence in {language} on why it matters>
+Output nothing else."""
+
+SPOTLIGHT_SYSTEM = """You write a LinkedIn post that goes deep on one tech, science or cybersecurity story,
+for a professional audience. The post is published with the article's cover image.
 
 Write the post in plain text, since LinkedIn does not render markdown:
 - An opening hook line that makes people stop scrolling, then a blank line.
@@ -48,10 +56,7 @@ Write the whole post in {language}, translating from the source article (hashtag
 English when that is how they are commonly used).
 
 Keep it under 1,800 characters. Be accurate: only state what the article title and summary
-support, and never invent numbers or quotes.
-
-The first line of your output must be STORY: followed by the number of the article you picked,
-e.g. "STORY: 7". Then output only the post text."""
+support, and never invent numbers or quotes. Output only the post text."""
 
 
 def _format(articles: list[Article]) -> str:
@@ -62,9 +67,9 @@ def _format(articles: list[Article]) -> str:
     return "\n\n".join(lines)
 
 
-def _write(system: str, articles: list[Article], extra: str = "") -> str:
+def _write(system: str, content: str, **fields) -> str:
     voice = os.getenv("AUTHOR_VOICE", "").strip()
-    system = system.format(language=os.getenv("POST_LANGUAGE", "English")) + (f"\n\nAbout the author, to match their voice and perspective: {voice}" if voice else "")
+    system = system.format(language=os.getenv("POST_LANGUAGE", "English"), **fields) + (f"\n\nAbout the author, to match their voice and perspective: {voice}" if voice else "")
     # Only needed for API keys that aren't scoped to a workspace
     workspace = os.getenv("ANTHROPIC_WORKSPACE_ID", "").strip()
     client = anthropic.Anthropic(default_headers={"anthropic-workspace-id": workspace} if workspace else None)
@@ -75,7 +80,7 @@ def _write(system: str, articles: list[Article], extra: str = "") -> str:
         betas=["server-side-fallback-2026-07-01"],
         fallbacks="default",
         system=system,
-        messages=[{"role": "user", "content": "Candidate articles from the past week:\n\n" + _format(articles) + extra}],
+        messages=[{"role": "user", "content": content}],
     )
     if response.stop_reason == "refusal":
         raise RuntimeError(f"Claude declined to write the post: {response.stop_details}")
@@ -86,21 +91,31 @@ def _write(system: str, articles: list[Article], extra: str = "") -> str:
 
 
 def write_digest(articles: list[Article]) -> str:
-    return _write(SYSTEM, articles)
+    return _write(SYSTEM, "Candidate articles from the past week:\n\n" + _format(articles))
 
 
-def write_spotlight(articles: list[Article], recent_posts: list[str] = ()) -> tuple[Article, str]:
-    """Pick the story of the week and write a post about it. Returns the article and the post text.
+def rank_stories(articles: list[Article], recent_posts: list[str] = (), count: int = 4) -> list[tuple[Article, str]]:
+    """The most relevant stories to post about, each with why it matters, most relevant first.
 
-    recent_posts are posts already published or drafted; their stories are not picked again,
+    recent_posts are posts already published or drafted; their stories are left out,
     even when another outlet reports them.
     """
-    extra = ""
+    content = "Candidate articles from the past week:\n\n" + _format(articles)
     if recent_posts:
-        extra = ("\n\nThese posts already covered some stories recently. Do not pick a story they cover, "
-                 "even from a different source:\n\n" + "\n\n---\n\n".join(recent_posts))
-    text = _write(SPOTLIGHT_SYSTEM, articles, extra)
-    m = re.match(r"STORY:\s*\[?(\d+)\]?\s*\n", text)
-    if not m or not 1 <= int(m.group(1)) <= len(articles):
-        raise RuntimeError(f"Claude did not say which story it picked:\n{text[:200]}")
-    return articles[int(m.group(1)) - 1], text[m.end():].strip()
+        content += ("\n\nThese posts already covered some stories recently. Do not pick a story they cover, "
+                    "even from a different source:\n\n" + "\n\n---\n\n".join(recent_posts))
+    text = _write(RANK_SYSTEM, content, count=count)
+    picks, seen = [], set()
+    for m in re.finditer(r"^STORY:\s*\[?(\d+)\]?\s*\|\s*(.+)$", text, re.M):
+        n = int(m.group(1))
+        if 1 <= n <= len(articles) and n not in seen:
+            seen.add(n)
+            picks.append((articles[n - 1], m.group(2).strip()))
+    if not picks:
+        raise RuntimeError(f"Claude did not list any stories:\n{text[:200]}")
+    return picks[:count]
+
+
+def write_spotlight(article: Article) -> str:
+    """Write a post that goes deep on one story."""
+    return _write(SPOTLIGHT_SYSTEM, "The story:\n\n" + _format([article]))

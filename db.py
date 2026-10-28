@@ -18,12 +18,13 @@ SCHEMA = """
     CREATE TABLE IF NOT EXISTS drafts (
         id TEXT PRIMARY KEY,
         text TEXT NOT NULL,
-        status TEXT NOT NULL DEFAULT 'pending',  -- pending | posted | skipped
+        status TEXT NOT NULL DEFAULT 'pending',  -- choosing | pending | posted | skipped
         post_urn TEXT,
         created_at DOUBLE PRECISION NOT NULL,
         kind TEXT NOT NULL DEFAULT 'digest',  -- digest | spotlight
         image_url TEXT,
-        image_alt TEXT
+        image_alt TEXT,
+        options TEXT  -- JSON list of stories to choose from, while status is 'choosing'
     );
     CREATE TABLE IF NOT EXISTS auth (
         id INTEGER PRIMARY KEY CHECK (id = 1),
@@ -34,7 +35,8 @@ SCHEMA = """
     );
 """
 # Columns added after the first release, for databases created before them
-NEW_COLUMNS = {"drafts": [("kind", "TEXT NOT NULL DEFAULT 'digest'"), ("image_url", "TEXT"), ("image_alt", "TEXT")]}
+NEW_COLUMNS = {"drafts": [("kind", "TEXT NOT NULL DEFAULT 'digest'"), ("image_url", "TEXT"), ("image_alt", "TEXT"),
+                       ("options", "TEXT")]}
 _schema_ready = False
 
 
@@ -92,11 +94,11 @@ class _PgCursor:
         return self._cur.fetchall()
 
 
-def new_draft(text: str, kind: str = "digest", image_url: str | None = None, image_alt: str | None = None) -> str:
+def new_draft(text: str, kind: str = "digest", status: str = "pending", options: str | None = None) -> str:
     draft_id = secrets.token_urlsafe(16)  # doubles as the secret in the approval link
     with _cursor() as c:
-        c.execute("INSERT INTO drafts (id, text, created_at, kind, image_url, image_alt) VALUES (?, ?, ?, ?, ?, ?)",
-                  (draft_id, text, time.time(), kind, image_url, image_alt))
+        c.execute("INSERT INTO drafts (id, text, created_at, kind, status, options) VALUES (?, ?, ?, ?, ?, ?)",
+                  (draft_id, text, time.time(), kind, status, options))
     return draft_id
 
 
@@ -109,7 +111,7 @@ def get_draft(draft_id: str):
 def recent_drafts(days: int) -> list:
     """Drafts from the last `days` days that were posted or are still waiting for review."""
     with _cursor() as c:
-        c.execute("SELECT * FROM drafts WHERE created_at > ? AND status != 'skipped' ORDER BY created_at DESC",
+        c.execute("SELECT * FROM drafts WHERE created_at > ? AND status IN ('pending', 'posted') ORDER BY created_at DESC",
                   (time.time() - days * 86400,))
         return c.fetchall()
 

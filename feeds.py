@@ -27,6 +27,10 @@ FEEDS = [
     ("SpaceX / NASA", "NASA", "https://www.nasa.gov/news-release/feed/"),
     ("SpaceX / NASA", "SpaceNews", "https://spacenews.com/feed/"),
     ("SpaceX / NASA", "NASASpaceflight", "https://www.nasaspaceflight.com/feed/"),
+    ("Cybersecurity", "The Hacker News", "https://feeds.feedburner.com/TheHackersNews"),
+    ("Cybersecurity", "BleepingComputer", "https://www.bleepingcomputer.com/feed/"),
+    ("Cybersecurity", "Krebs on Security", "https://krebsonsecurity.com/feed/"),
+    ("Cybersecurity", "Dark Reading", "https://www.darkreading.com/rss.xml"),
 ]
 
 MAX_PER_FEED = 10
